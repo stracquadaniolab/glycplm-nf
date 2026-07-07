@@ -1,0 +1,16 @@
+name: glycplm-nf
+channels:
+  - conda-forge
+  - bioconda
+channel_priority: strict
+dependencies:
+  - python=3.12.13
+  - pip
+  - git
+  - pandas
+  - numpy
+  - scikit-learn
+  - tqdm
+  - docopt
+  - procps-ng
+
