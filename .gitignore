@@ -1,7 +1,11 @@
 work/
 results/
 logs/
+data/
+results-test/
+null/
 .DS_Store
 *.pyc
 .vscode
 .nextflow*
+glycplm-nf.sif

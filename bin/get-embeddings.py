@@ -23,10 +23,12 @@ model = AutoModelForMaskedLM.from_pretrained(
     device_map="auto",
 ).eval()
 
-def get_embeddings( 
+def get_embeddings(
+        entries,
+        entry_names,
         sequences, 
         labels,
-        batch_size=8,
+        batch_size,
         model=model, 
         tokenizer=tokenizer
         ):
@@ -39,6 +41,10 @@ def get_embeddings(
         List of protein sequences.
     labels: list[str]
         List of glycosylation binary strings corresponding to the sequences.
+    entries: list[str]
+        List of entry IDs corresponding to the sequences.
+    entry_names: list[str]
+        List of entry names corresponding to the sequences.
     batch_size: int
         Number of sequences to process in a batch.
     model: AutoModelForMaskedLM
@@ -48,16 +54,19 @@ def get_embeddings(
 
     Returns:
     list[dict]
-        A list of dictionaries, each containing 'embedding' and 'label' for a protein.
+        A list of dictionaries, each containing 'entry', 'entry_name', 
+        'sequence', 'embedding' and 'label' for a protein.
     '''
 
     logger.info(f"Generating embeddings for {len(sequences)} sequences, batch_size={batch_size}")
     embedding_data = []
     n_skipped = 0
 
-    for i in tqdm(range(0, len(sequences), batch_size)):
+    for i in tqdm(range(0, len(sequences), batch_size), mininterval=30, maxinterval=60):
         batch_seqs = sequences[i:i+batch_size]
         batch_labels = labels[i:i+batch_size]
+        batch_entries = entries[i:i+batch_size]
+        batch_entry_names = entry_names[i:i+batch_size]
         
         # Tokenise
         inputs = tokenizer(batch_seqs, return_tensors="pt", padding='longest')
@@ -81,17 +90,20 @@ def get_embeddings(
             seq_embedding = hidden_states[j, valid_positions, :].cpu()  # Shape: [protein_length, 960]
             
             # 4. Extract the matching label string and convert to tensor of integers
-            label_str = batch_labels[j]
+            label = batch_labels[j]
             # Ensure the label string length matches the number of valid positions
             try:
-                assert len(label_str) == seq_embedding.shape[0], "Length mismatch! Check labels."
+                assert len(label) == seq_embedding.shape[0], "Length mismatch! Check labels."
             except AssertionError as e:
                 n_skipped += 1
                 logger.warning(f"Skipping sequence {i+j}: {e}")
                 continue
-            seq_label = torch.tensor([int(c) for c in label_str], dtype=torch.long)
-            
+            seq_label = torch.tensor(label, dtype=torch.long)
+
             embedding_data.append({
+                'entry': batch_entries[j],
+                'entry_name': batch_entry_names[j],
+                'sequence': batch_seqs[j],
                 'embedding': seq_embedding,
                 'label': seq_label
             })
@@ -102,17 +114,19 @@ def get_embeddings(
 
 def main():
     parser = argparse.ArgumentParser(description="Generate ESMC embeddings for protein sequences")
-    parser.add_argument("--input", required=True, help="Path to processed DataFrame pickle (from preprocess.py)")
+    parser.add_argument("--input", required=True, help="Path to processed/split JSON file (from preprocess.py)")
     parser.add_argument("--output", required=True, help="Path to output .pt file with embedding_data list")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for embedding generation")
     args = parser.parse_args()
  
-    df = pd.read_pickle(args.input)
+    df = pd.read_json(args.input, orient='records')
  
+    entries = df["Entry"].tolist()
+    entry_names = df["Entry Name"].tolist()
     sequences = df["Sequence"].tolist()
     labels = df["Glycosylation_binary"].tolist()
  
-    embedding_data = get_embeddings(sequences, labels, batch_size=args.batch_size)
+    embedding_data = get_embeddings(entries, entry_names, sequences, labels, batch_size=args.batch_size)
  
     torch.save(embedding_data, args.output)
     logger.info(f"Saved embedding data to {args.output}")

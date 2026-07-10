@@ -5,8 +5,10 @@ import json
 import torch
 import torch.nn as nn
 import logging
+import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, precision_recall_curve, precision_recall_fscore_support
 from classifier import ResidueClassifier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -14,33 +16,39 @@ logger = logging.getLogger(__name__)
 
 def split_embedding_data(
         embedding_data,
-        val_size=0.2,
-        random_state=42
+        val_size,
+        test_size,
+        random_state
         ):
     
     '''
-    Split a list of {'embedding':..., 'label':...} dicts into training and validation sets.
+    Split a list of {'embedding':..., 'label':...} dicts into training and
+    validation sets.
 
     Parameters:
     embedding_data: list[dict]
         List of dictionaries containing embeddings and labels for each protein.
     val_size: float
-        Fraction of the dataset to be used for validation.
+        Fraction of the data (from full dataset) to be used for validation.
+    test_size: float
+        Fraction of the dataset held out as the test set.
     random_state: int
         Random seed for reproducibility.   
 
     Returns:
     train_data: list[dict]
-        List of dictionaries for the training set.
     val_data: list[dict]
-        List of dictionaries for the validation set.
     '''
+    
+    # Split the remainder into train/val
+    relative_val_size = val_size / (1 - test_size)
     
     train_data, val_data = train_test_split(
         embedding_data,
-        test_size=val_size,
+        test_size=relative_val_size,
         random_state=random_state
     )
+    
     return train_data, val_data
 
 def flatten_embeddings(
@@ -67,7 +75,9 @@ def flatten_embeddings(
     
     return all_embeds, all_labels
 
-def compute_class_weight(labels):
+def compute_class_weight(
+        labels
+        ):
     '''
     Compute class weight for binary classification based on the training labels.
     
@@ -87,16 +97,110 @@ def compute_class_weight(labels):
 
     return class_weight
 
+def find_optimal_threshold(
+        val_probs, 
+        val_labels, 
+        metric='f1'
+        ):
+    '''
+    Find threshold that maximises the chosen metric on validation set.
+
+    Parameters:
+    val_probs: torch.Tensor
+        Probabilities of residues being glycosylated.
+    val_labels: torch.Tensor
+        True labels.
+    metric: 'f1', 'precision', 'recall', or 'youden' (maximizes TPR - FPR)
+        Metric to optimise.
+
+    Returns:
+    best_threshold: float
+        Best threshold for glycosylated/nonglycosylated prediction.
+    best_metric:float
+        Best value of the chosen metric.
+
+    '''
+    precisions, recalls, thresholds = precision_recall_curve(val_labels, val_probs)
+    
+    if metric == 'f1':
+        f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+        best_idx = np.argmax(f1_scores[:-1])  # exclude last threshold (0)
+        best_threshold = thresholds[best_idx]
+        best_score = f1_scores[best_idx]
+    elif metric == 'youden':
+        # Youden's J statistic
+        fpr = 1 - precisions  # approximate, or compute from confusion matrix
+        youden = recalls - (1 - precisions)  # TPR - FPR
+        best_idx = np.argmax(youden[:-1])
+        best_threshold = thresholds[best_idx]
+        best_score = youden[best_idx]
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+    
+    return best_threshold, best_score
+
+def evaluate(
+        classifier, 
+        embeds, 
+        labels, 
+        loss_fn,
+        threshold):
+    '''
+    Evaluate the classifier on a held-out set.
+
+    Parameters:
+    classifier: nn.Module
+        The trained classifier model.
+    embeds: torch.Tensor
+        Embeddings of shape [num_samples, hidden_size].
+    labels: torch.Tensor
+        True labels of shape [num_samples].
+    loss_fn: nn.Module
+        Loss function used for evaluation.
+    threshold: float
+        Threshold to make decisions whether resie is glycosylated or not.
+
+    Returns:
+    dict with loss, precision, recall, f1, ROC AUC, PR AUC
+    '''
+    classifier.eval()
+    with torch.no_grad():
+        logits = classifier(embeds)
+        loss = loss_fn(logits, labels).item()
+        probs = torch.softmax(logits, dim=-1)[:, 1]
+        preds = (probs >= threshold).long()
+
+        labels_np = labels.cpu().numpy()
+        probs_np = probs.cpu().numpy()
+        preds_np = preds.cpu().numpy()
+
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            labels_np, preds_np, average="binary", zero_division=0
+        )
+        
+        try:
+            roc_auc = roc_auc_score(labels_np, probs_np)
+            pr_auc = average_precision_score(labels_np, probs_np)
+        except ValueError:
+            roc_auc, pr_auc = float('nan'), float('nan')
+            logger.warning("AUC undefined: Only one class present in the split")
+
+    return {
+        "loss": loss, "precision": precision, "recall": recall, "f1": f1,
+        "roc_auc": roc_auc, "pr_auc": pr_auc
+    }
+
 def train_classifier(
         classifier,
         train_embeds, 
         train_labels, 
         val_embeds, 
         val_labels,
-        num_epochs=5, 
-        batch_size=256, 
-        lr=1e-4, 
-        weight=None):
+        num_epochs, 
+        batch_size, 
+        lr, 
+        weight,
+        metric):
     """
     Train the residue-level classifier using a class-weighted loss to handle imbalance.
 
@@ -117,10 +221,13 @@ def train_classifier(
         Learning rate
     weight: torch.Tensor or None
         Class weight for the loss function
+    metric: 
+        Metric used to optimise threshold.
 
     Returns:
     dict
-        History of per-epoch train/val metrics
+        History of per-epoch train/val metrics, evaluated at each epoch's
+        freshly-optimised threshold.
     """
     optimizer = torch.optim.Adam(classifier.parameters(), lr=lr)
     weight = compute_class_weight(train_labels) if weight is None else weight
@@ -129,7 +236,18 @@ def train_classifier(
     train_dataset = TensorDataset(train_embeds, train_labels)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-    history = {"train_loss": [], "val_loss": [], "precision": [], "recall": [], "f1": []}
+    logger.info(f'Using {metric} to optimise threshold.')
+
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "precision": [],
+        "recall": [],
+        "f1": [],
+        "roc_auc": [],
+        "pr_auc": [],
+        "best_threshold": []
+        }
 
     for epoch in range(num_epochs):
         # Training
@@ -137,7 +255,7 @@ def train_classifier(
         total_loss = 0
 
         for batch_embeds, batch_labels in train_loader:
-            logits = classifier(batch_embeds)  # [batch_size, 2]
+            logits = classifier(batch_embeds)
             loss = loss_fn(logits, batch_labels)
 
             optimizer.zero_grad()
@@ -148,29 +266,35 @@ def train_classifier(
 
         avg_train_loss = total_loss / len(train_loader)
 
-        # Validation
+        # Validation 
         classifier.eval()
         with torch.no_grad():
             val_logits = classifier(val_embeds)
             val_loss = loss_fn(val_logits, val_labels).item()
-            preds = torch.argmax(val_logits, dim=-1)
+            val_probs = torch.softmax(val_logits, dim=-1)[:, 1]
 
-            tp = ((preds == 1) & (val_labels == 1)).sum().item()
-            fp = ((preds == 1) & (val_labels == 0)).sum().item()
-            fn = ((preds == 0) & (val_labels == 1)).sum().item()
+        val_probs_np = val_probs.cpu().numpy()
+        val_labels_np = val_labels.cpu().numpy()
 
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
-            f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        # Find this epoch's optimal threshold from the current probability distribution
+        best_thresh, _ = find_optimal_threshold(val_probs_np, val_labels_np, metric)
 
-        history["train_loss"].append(avg_train_loss)
-        history["val_loss"].append(val_loss)
-        history["precision"].append(precision)
-        history["recall"].append(recall)
-        history["f1"].append(f1)
+        # Evaluate at that threshold
+        threshold_metrics = evaluate(classifier, val_embeds, val_labels, loss_fn, threshold=best_thresh)
 
-        logger.info(f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f} | Val Loss = {val_loss:.4f} "
-                    f"| Precision = {precision:.3f} | Recall = {recall:.3f} | F1 = {f1:.3f}")
+        history["train_loss"].append(float(avg_train_loss))
+        history["val_loss"].append(float(threshold_metrics["loss"]))
+        history["precision"].append(float(threshold_metrics["precision"]))
+        history["recall"].append(float(threshold_metrics["recall"]))
+        history["f1"].append(float(threshold_metrics["f1"]))
+        history["roc_auc"].append(float(threshold_metrics["roc_auc"]))
+        history["pr_auc"].append(float(threshold_metrics["pr_auc"]))
+        history["best_threshold"].append(float(best_thresh))
+
+        logger.info(f"Epoch {epoch}: Train Loss = {avg_train_loss:.4f} | Val Loss = {threshold_metrics['loss']:.4f} "
+            f"| Precision = {threshold_metrics['precision']:.3f} | Recall = {threshold_metrics['recall']:.3f} "
+            f"| F1 = {threshold_metrics['f1']:.3f} | ROC-AUC = {threshold_metrics['roc_auc']:.3f} "
+            f"| PR-AUC = {threshold_metrics['pr_auc']:.3f} | Best Thresh = {best_thresh:.3f}")
 
     return history
 
@@ -179,35 +303,40 @@ def main():
     parser.add_argument("--input", required=True, help="Path to embedding_data .pt file (from get_embeddings.py)")
     parser.add_argument("--model_out", required=True, help="Path to save trained model state_dict (.pt)")
     parser.add_argument("--history_out", required=True, help="Path to save training history (.json)")
-    parser.add_argument("--val_size", type=float, default=0.2, help="Fraction of proteins held out for validation")
-    parser.add_argument("--random_state", type=int, default=42, help="Random seed for the train/val split")
-    parser.add_argument("--num_epochs", type=int, default=5, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size (residues per batch)")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--hidden_size", type=int, default=960, help="Embedding hidden size (ESMC-300M = 960)")
+    parser.add_argument("--threshold_out", required=True, help="Path to save the final optimised decision threshold (.json)")
+    parser.add_argument("--val_size", type=float, help="Fraction of proteins held out for validation")
+    parser.add_argument("--test_size", type=float, help="Fraction of proteins held out for testing")
+    parser.add_argument("--random_state", type=int, help="Random seed for the train/val/test split")
+    parser.add_argument("--num_epochs", type=int, help="Number of training epochs")
+    parser.add_argument("--batch_size", type=int, help="Batch size (residues per batch)")
+    parser.add_argument("--lr", type=float, help="Learning rate")
+    parser.add_argument("--hidden_size", type=int, help="Embedding hidden size (ESMC-300M = 960)")
+    parser.add_argument("--optimise_metric", help="Metric used to optimise threshold for glycosylation prediction")
     args = parser.parse_args()
- 
-    embedding_data = torch.load(args.input)
- 
+
+    embedding_data = torch.load(args.input, weights_only=True)
+
     train_data, val_data = split_embedding_data(
         embedding_data,
         val_size=args.val_size,
+        test_size=args.test_size,
         random_state=args.random_state,
     )
- 
+    logger.info(f"Split: {len(train_data)} train / {len(val_data)} val proteins")
+
     train_embeds, train_labels = flatten_embeddings(train_data)
     val_embeds, val_labels = flatten_embeddings(val_data)
-    logger.info(f"Train proteins: {len(train_data)}, Val proteins: {len(val_data)}")
     logger.info(f"Train residues: {train_embeds.shape[0]}, Val residues: {val_embeds.shape[0]}")
- 
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Training using device: {device}")
     train_embeds, train_labels = train_embeds.to(device), train_labels.to(device)
     val_embeds, val_labels = val_embeds.to(device), val_labels.to(device)
- 
+
     classifier = ResidueClassifier(hidden_size=args.hidden_size).to(device)
- 
+
     weight = compute_class_weight(train_labels)
- 
+
     history = train_classifier(
         classifier,
         train_embeds,
@@ -218,15 +347,21 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         weight=weight,
+        metric=args.optimise_metric
     )
- 
+
     torch.save(classifier.state_dict(), args.model_out)
     with open(args.history_out, "w") as f:
         json.dump(history, f, indent=2)
+
+    final_threshold = history["best_threshold"][-1]
+    with open(args.threshold_out, "w") as f:
+        json.dump({"threshold": final_threshold, "metric": args.optimise_metric}, f, indent=2)
+    logger.info(f"Saved final threshold ({final_threshold:.3f}, optimised for {args.optimise_metric}) to {args.threshold_out}")
  
-    print(f"Saved trained model to {args.model_out}")
-    print(f"Saved training history to {args.history_out}")
- 
+    logger.info(f"Saved trained model to {args.model_out}")
+    logger.info(f"Saved training history to {args.history_out}")
+
+
 if __name__ == "__main__":
     main()
- 
