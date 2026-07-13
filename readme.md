@@ -1,5 +1,7 @@
 # glycplm-nf
 
+![](https://img.shields.io/badge/current_version-v0.1.1-blue)
+
 A Nextflow pipeline for residue-level protein glycosylation site prediction. This is a baseline version that uses the ESMC-300M protein language model for embeddings and a lightweight linear classifier to predict glycosylation.
 
 ## Overview

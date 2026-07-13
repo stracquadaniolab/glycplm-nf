@@ -91,7 +91,7 @@ def load_data(
         axis=1
         )
 
-    n_pos_sites = df['Glycosylation_binary'].apply(lambda s: s.count('1')).sum()
+    n_pos_sites = df['Glycosylation_binary'].apply(lambda s: sum(s)).sum()
     logger.info(f"Total annotated glycosylation sites: {n_pos_sites}")
 
     df = df[['Entry', 'Entry Name', 'Sequence', 'Glycosylation_binary']].reset_index(drop=True)
