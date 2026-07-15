@@ -1,8 +1,8 @@
 # glycplm-nf
 
-![](https://img.shields.io/badge/current_version-v0.1.1-blue)
+![](https://img.shields.io/badge/current_version-v0.1.2-blue)
 
-A Nextflow pipeline for residue-level protein glycosylation site prediction. This is a baseline version that uses the ESMC-300M protein language model for embeddings and a lightweight linear classifier to predict glycosylation.
+A Nextflow pipeline for residue-level protein glycosylation site prediction. This pipeline uses the ESMC-300M protein language model to generate residue embeddings, followed by a lightweight classifier for residue-level glycosylation prediction
 
 ## Overview
 
@@ -10,10 +10,18 @@ Given a TSV of protein sequences with annotated glycosylation sites, the pipelin
 
 ```
 train:
-  raw TSV ──▶ PREPROCESS ──▶ SPLIT_TEST ──▶ EMBED ──▶ TRAIN ──▶ classifier.pt + threshold.json + history.json
+
+Raw TSV ──▶ PREPROCESS ──▶ SPLIT_TEST (optional) ──▶ EMBED ──▶ TRAIN ──▶ classifier.pt
+                        ▲                        ▲          ▲           + threshold.json
+                        │                        |          │           + history.json
+                    input_json               input_json  embedding_pt
 
 predict:
-  raw TSV ──▶ PREPROCESS ──▶ EMBED ──▶ PREDICT ──▶ predictions.json (+ test-metrics.json)
+
+Raw TSV ──▶ PREPROCESS ──▶ EMBED ──▶ PREDICT ──▶ predictions.json 
+                        ▲         ▲              (+ test-metrics.json)
+                        │         │
+                    input_json  embedding_pt
 ```
 
 `SPLIT_TEST` is only run for the `train` entry (and only when `--split_test` is enabled); it splits off a held-out test set before embedding. `PREDICT` consumes a trained `classifier.pt` (and, optionally, its optimised `threshold.json`) to score new or held-out sequences.
@@ -24,7 +32,7 @@ predict:
 
 Reads the raw TSV, drops proteins with no glycosylation annotation (optional), filters out proteins longer than a given length (optional), and converts each protein's `Glycosylation` annotation string (UniProt-style `CARBOHYD <position>` entries) into a binary list the same length as its sequence.
 
-- **Input**: TSV with `Entry`, `Entry Nmae`, `Sequence` and `Glycosylation` columns
+- **Input**: TSV with `Entry`, `Entry Name`, `Sequence` and `Glycosylation` columns
 - **Output**: `processed.json` — records with `Entry`, `Entry Name`, `Sequence`, `Glycosylation_binary`
 
 ### 2. SPLIT_TEST (`split-test.py`) — `train` entry only
@@ -99,6 +107,9 @@ You can also start either entry from an already-preprocessed JSON file with `--i
 | `--input_json` | `null` | Path to an already-preprocessed JSON file (skips PREPROCESS) |
 | `--model_ckpt` | `null` | Path to a trained `classifier.pt` (required for `--entry predict`) |
 | `--outdir` | `results` | Output directory |
+| `--embedding_pt` | `null`  | Skip preprocessing and embedding by supplying a precomputed embedding `.pt` file. |
+| `--cache_dir` | project-specific | Directory used to cache preprocessing, split and embedding outputs. |
+
 
 ### Preprocessing
 
@@ -127,6 +138,9 @@ You can also start either entry from an already-preprocessed JSON file with `--i
 | `--hidden_size` | `960` | Embedding hidden size (ESMC-300M = 960) |
 | `--dropout` | `0.1` | Dropout applied before the classifier's linear layer |
 | `--optimise_metric` | `f1` | Metric used to optimise the decision threshold (`f1` or `youden`) |
+| `--classifier`      | `LL`    | Classifier architecture. `LL` uses a single linear layer; `MLP` uses a two-layer multilayer perceptron. |
+| `--mlp_hidden_size` | `256`   | Hidden dimension of the MLP classifier (used only when `--classifier MLP`).                             |
+
 
 ### Prediction
 
@@ -139,30 +153,34 @@ You can also start either entry from an already-preprocessed JSON file with `--i
 
 ```
 results/
-├── preprocess/
-│   ├── processed.json
-│   └── preprocess.log
-├── split-test/                      # train entry, if --split_test
-│   ├── processed-train-val.json
-│   ├── processed-test.json
-│   └── split-test.log
-├── embeddings/
-│   ├── embedding-data.pt
-│   └── embed.log
-├── model/                           # train entry
-│   ├── classifier.pt
-│   ├── threshold.json
-│   ├── history.json
-│   └── train.log
-├── predictions/                     # predict entry
+├── train/
+│   ├── preprocess.log
+│   ├── split-test.log
+│   ├── embeddings/
+│   │   └── embed-train.log
+│   └── model/
+│       ├── classifier.pt
+│       ├── threshold.json
+│       ├── history.json
+│       └── train.log
+├── predict/
+│   ├── embeddings/
+│   │   └── embed-predict.log
 │   ├── predictions.json
-│   ├── test-metrics.json            # only if ground-truth labels are present
+│   ├── test-metrics.json
 │   └── predict.log
-└── pipeline_info/
-    ├── timeline.html
-    ├── report.html
-    ├── trace.txt
-    └── dag.html
+├── pipeline_info/
+└── params.log
+
+cache/
+├── preprocess/
+│   └── processed.json
+├── split-test/
+│   ├── processed-train-val.json
+│   └── processed-test.json
+└── embeddings/
+    ├── embedding-data-train.pt
+    └── embedding-data-predict.pt
 ```
 
 ## License
