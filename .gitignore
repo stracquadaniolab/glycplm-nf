@@ -1,8 +1,7 @@
 work/
 results/
-logs/
+cache/
 data/
-results-test/
 null/
 .DS_Store
 *.pyc

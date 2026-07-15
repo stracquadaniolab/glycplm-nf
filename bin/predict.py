@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_fscore_support
-from classifier import ResidueClassifier
+from classifiers import ResidueClassifier, ResidueClassifierMLP
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -90,8 +90,8 @@ def compute_metrics(labels, probs, threshold):
  
     return {
         "n_residues": int(len(labels_arr)),
-        "threshold": float(threshold),  # CHANGED: record which threshold was used
-        "precision": float(precision),  # CHANGED: explicit float() cast for JSON serialisation safety
+        "threshold": float(threshold),
+        "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
         "roc_auc": float(roc_auc),
@@ -106,9 +106,12 @@ def main():
     parser.add_argument("--embedding_input", required=True, help="Path to embedding_data .pt file (from get_embeddings.py)")
     parser.add_argument("--model_ckpt", required=True, help="Path to trained model state_dict (.pt, from train.py)")
     parser.add_argument("--hidden_size", type=int, help="Embedding hidden size (must match training)")
+    parser.add_argument("--dropout", type=float, help="Dropout rate for classifier training")
     parser.add_argument("--threshold", type=float, default=0.5, help="Decision threshold for glycosylation prediction (use the optimised threshold from train.py)")
     parser.add_argument("--predictions_out", required=True, help="Path to save per-residue predictions (.json)")
     parser.add_argument("--metrics_out", default=None, help="Path to save aggregate metrics (.json); only written if ground-truth labels are present")
+    parser.add_argument("--classifier", help="Whether to use single linear layer classifier ('LL') or MLP ('MLP')")
+    parser.add_argument("--mlp_hidden_size", type=int, help="If using MLP, which hidden dimensions to use")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -118,7 +121,13 @@ def main():
     embedding_data = torch.load(args.embedding_input, weights_only=True)
     logger.info(f"Loaded embeddings for {len(embedding_data)} proteins")
 
-    classifier = ResidueClassifier(hidden_size=args.hidden_size).to(device)
+    if args.classifier == 'LL':
+        classifier = ResidueClassifier(dropout=args.dropout, input_dim=args.hidden_size).to(device)
+    elif args.classifier == 'MLP':
+        classifier = ResidueClassifierMLP(dropout=args.dropout, input_dim=args.hidden_size, hidden_dim=args.mlp_hidden_size).to(device)
+    else:
+        raise ValueError(f"Unknown classifier: {args.classifier}")
+
     state_dict = torch.load(args.model_ckpt, map_location=device, weights_only=True)
     classifier.load_state_dict(state_dict)
     logger.info(f"Loaded model checkpoint from {args.model_ckpt}")

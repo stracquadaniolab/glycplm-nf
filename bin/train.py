@@ -9,7 +9,7 @@ import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, precision_recall_curve, precision_recall_fscore_support
-from classifier import ResidueClassifier
+from classifiers import ResidueClassifier, ResidueClassifierMLP
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -311,7 +311,10 @@ def main():
     parser.add_argument("--batch_size", type=int, help="Batch size (residues per batch)")
     parser.add_argument("--lr", type=float, help="Learning rate")
     parser.add_argument("--hidden_size", type=int, help="Embedding hidden size (ESMC-300M = 960)")
+    parser.add_argument("--dropout", type=float, help="Dropout rate for classifier training")
     parser.add_argument("--optimise_metric", help="Metric used to optimise threshold for glycosylation prediction")
+    parser.add_argument("--classifier", help="Whether to use single linear layer classifier ('LL') or MLP ('MLP')")
+    parser.add_argument("--mlp_hidden_size", type=int, help="If using MLP, which hidden dimensions to use")
     args = parser.parse_args()
 
     embedding_data = torch.load(args.input, weights_only=True)
@@ -333,7 +336,12 @@ def main():
     train_embeds, train_labels = train_embeds.to(device), train_labels.to(device)
     val_embeds, val_labels = val_embeds.to(device), val_labels.to(device)
 
-    classifier = ResidueClassifier(hidden_size=args.hidden_size).to(device)
+    if args.classifier == 'LL':
+        classifier = ResidueClassifier(dropout=args.dropout, input_dim=args.hidden_size).to(device)
+    elif args.classifier == 'MLP':
+        classifier = ResidueClassifierMLP(dropout=args.dropout, input_dim=args.hidden_size, hidden_dim=args.mlp_hidden_size).to(device)
+    else:
+        raise ValueError(f"Unknown classifier: {args.classifier}")
 
     weight = compute_class_weight(train_labels)
 
